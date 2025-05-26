@@ -18,13 +18,10 @@ package compose
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/cloudwego/eino/internal/serialization"
 )
-
-var InterruptAndRerun = errors.New("interrupt and rerun")
 
 // RegisterSerializableType registers a custom type for eino serialization.
 // This allows eino to properly serialize and deserialize custom types.
@@ -71,6 +68,8 @@ type checkpoint struct {
 	State          any
 	SkipPreHandler map[string]bool
 
+	ToolsNodeExecutedTools map[string] /*tool node key*/ map[string] /*tool call id*/ string
+
 	SubGraphs map[string]*checkpoint
 }
 
@@ -91,6 +90,10 @@ func setNodeKey(ctx context.Context, key string) context.Context {
 		return context.WithValue(ctx, nodePathKey{}, NewNodePath(key))
 	}
 	return context.WithValue(ctx, nodePathKey{}, NewNodePath(append(path.path, key)...))
+}
+
+func clearNodeKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, nodePathKey{}, nil)
 }
 
 func getStateModifier(ctx context.Context) StateModifier {

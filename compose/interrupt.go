@@ -33,12 +33,38 @@ func WithInterruptAfterNodes(nodes []string) GraphCompileOption {
 	}
 }
 
+var InterruptAndRerun = errors.New("interrupt and rerun")
+
+func NewInterruptAndRerunErr(extra any) error {
+	return &interruptAndRerun{Extra: extra}
+}
+
+type interruptAndRerun struct {
+	Extra any
+}
+
+func (i *interruptAndRerun) Error() string {
+	return fmt.Sprintf("interrupt and rerun: %v", i.Extra)
+}
+
+func isInterruptRerunError(err error) (any, bool) {
+	if errors.Is(err, InterruptAndRerun) {
+		return nil, true
+	}
+	ire := &interruptAndRerun{}
+	if errors.As(err, &ire) {
+		return ire.Extra, true
+	}
+	return nil, false
+}
+
 type InterruptInfo struct {
-	State       any
-	BeforeNodes []string
-	AfterNodes  []string
-	RerunNodes  []string
-	SubGraphs   map[string]*InterruptInfo
+	State           any
+	BeforeNodes     []string
+	AfterNodes      []string
+	RerunNodes      []string
+	RerunNodesExtra map[string]any
+	SubGraphs       map[string]*InterruptInfo
 }
 
 func ExtractInterruptInfo(err error) (info *InterruptInfo, existed bool) {
@@ -48,6 +74,10 @@ func ExtractInterruptInfo(err error) (info *InterruptInfo, existed bool) {
 	var iE *interruptError
 	if errors.As(err, &iE) {
 		return iE.Info, true
+	}
+	var sIE *subGraphInterruptError
+	if errors.As(err, &sIE) {
+		return sIE.Info, true
 	}
 	return nil, false
 }
@@ -87,8 +117,9 @@ func isInterruptError(err error) bool {
 	if info := isSubGraphInterrupt(err); info != nil {
 		return true
 	}
-	if errors.Is(err, InterruptAndRerun) {
+	if _, ok := isInterruptRerunError(err); ok {
 		return true
 	}
+
 	return false
 }

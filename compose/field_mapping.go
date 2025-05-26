@@ -686,19 +686,14 @@ func validateFieldMapping(predecessorType reflect.Type, successorType reflect.Ty
 		return nil, fmt.Errorf("static check fail: predecessor output type should be struct or map, actual: %v", predecessorType)
 	}
 
-	var (
-		predecessorFieldType, successorFieldType                         reflect.Type
-		err                                                              error
-		predecessorIntermediateInterface, successorIntermediateInterface bool
-	)
-
-	for _, mapping := range mappings {
-		predecessorFieldType, predecessorIntermediateInterface, err = checkAndExtractFieldType(splitFieldPath(mapping.from), predecessorType)
+	for i := range mappings {
+		mapping := mappings[i]
+		predecessorFieldType, predecessorIntermediateInterface, err := checkAndExtractFieldType(splitFieldPath(mapping.from), predecessorType)
 		if err != nil {
 			return nil, fmt.Errorf("static check failed for mapping %s: %w", mapping, err)
 		}
 
-		successorFieldType, successorIntermediateInterface, err = checkAndExtractFieldType(splitFieldPath(mapping.to), successorType)
+		successorFieldType, successorIntermediateInterface, err := checkAndExtractFieldType(splitFieldPath(mapping.to), successorType)
 		if err != nil {
 			return nil, fmt.Errorf("static check failed for mapping %s: %w", mapping, err)
 		}
@@ -760,25 +755,31 @@ func validateFieldMapping(predecessorType reflect.Type, successorType reflect.Ty
 		return nil, nil
 	}
 
-	checker := func(value any) (any, error) {
-		mValue := value.(map[string]any)
+	checker := func(value map[string]any) (map[string]any, error) {
 		var err error
 		for k, v := range fieldCheckers {
-			for mapping := range mValue {
+			for mapping := range value {
 				if mapping == k {
-					mValue[mapping], err = v.invoke(mValue[mapping])
+					value[mapping], err = v.invoke(value[mapping])
 					if err != nil {
 						return nil, err
 					}
 				}
 			}
 		}
-		return mValue, nil
+		return value, nil
 	}
 	return &handlerPair{
-		invoke: checker,
+		invoke: func(value any) (any, error) {
+			return checker(value.(map[string]any))
+		},
 		transform: func(input streamReader) streamReader {
-			return packStreamReader(schema.StreamReaderWithConvert(input.toAnyStreamReader(), checker))
+			s, ok := unpackStreamReader[map[string]any](input)
+			if !ok {
+				// impossible
+				panic("field mapping edge stream value isn't map[string]any")
+			}
+			return packStreamReader(schema.StreamReaderWithConvert(s, checker))
 		},
 	}, nil
 }
