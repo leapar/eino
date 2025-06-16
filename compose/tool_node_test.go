@@ -629,11 +629,13 @@ func TestUnknownTool(t *testing.T) {
 			Role:       schema.Tool,
 			Content:    "unknown",
 			ToolCallID: "1",
+			ToolName:   "unknown1",
 		},
 		{
 			Role:       schema.Tool,
 			Content:    "unknown",
 			ToolCallID: "2",
+			ToolName:   "unknown2",
 		},
 	}
 
@@ -720,7 +722,7 @@ func TestToolRerun(t *testing.T) {
 	r, err := g.Compile(ctx, WithCheckPointStore(&inMemoryStore{m: map[string][]byte{}}))
 	assert.NoError(t, err)
 
-	_, err = r.Invoke(ctx, &schema.Message{Role: schema.Assistant, ToolCalls: tc}, WithCheckPointID("1"))
+	_, err = r.Stream(ctx, &schema.Message{Role: schema.Assistant, ToolCalls: tc}, WithCheckPointID("1"))
 	info, ok := ExtractInterruptInfo(err)
 	assert.True(t, ok)
 	assert.Equal(t, []string{"tool node"}, info.RerunNodes)
@@ -734,7 +736,9 @@ func TestToolRerun(t *testing.T) {
 		},
 	}, info.RerunNodesExtra["tool node"])
 
-	result, err := r.Invoke(ctx, nil, WithCheckPointID("1"))
+	sr, err := r.Stream(ctx, nil, WithCheckPointID("1"))
+	assert.NoError(t, err)
+	result, err := concatStreamReader(sr)
 	assert.NoError(t, err)
 	assert.Equal(t, "tool1 input: inputtool2 input: inputtool3 input: inputtool4 input: input", result)
 }
