@@ -76,6 +76,8 @@ type runner struct {
 	checkPointer         *checkPointer
 	interruptBeforeNodes []string
 	interruptAfterNodes  []string
+
+	mergeConfigs map[string]FanInMergeConfig
 }
 
 func (r *runner) invoke(ctx context.Context, input any, opts ...Option) (any, error) {
@@ -150,7 +152,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 	}
 
 	// Extract CheckPointID
-	checkPointID, stateModifier := getCheckPointInfo(opts...)
+	checkPointID, writeToCheckPointID, stateModifier, forceNewRun := getCheckPointInfo(opts...)
 	if checkPointID != nil && r.checkPointer.store == nil {
 		return nil, newGraphRunError(fmt.Errorf("receive checkpoint id but have not set checkpoint store"))
 	}
@@ -187,11 +189,11 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 
 		ctx, input = onGraphStart(ctx, input, isStream)
 		haveOnStart = true
-		nextTasks, err = r.restoreTasks(ctx, cp.Inputs, cp.SkipPreHandler, cp.ToolsNodeExecutedTools, optMap) // should restore after set state to context
+		nextTasks, err = r.restoreTasks(ctx, cp.Inputs, cp.SkipPreHandler, cp.ToolsNodeExecutedTools, cp.RerunNodes, isStream, optMap) // should restore after set state to context
 		if err != nil {
 			return nil, newGraphRunError(fmt.Errorf("restore tasks fail: %w", err))
 		}
-	} else if checkPointID != nil {
+	} else if checkPointID != nil && !forceNewRun {
 		cp, err := getCheckPointFromStore(ctx, *checkPointID, r.checkPointer)
 		if err != nil {
 			return nil, newGraphRunError(fmt.Errorf("load checkpoint from store fail: %w", err))
@@ -224,7 +226,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 			ctx, input = onGraphStart(ctx, input, isStream)
 			haveOnStart = true
 			// resume graph
-			nextTasks, err = r.restoreTasks(ctx, cp.Inputs, cp.SkipPreHandler, cp.ToolsNodeExecutedTools, optMap)
+			nextTasks, err = r.restoreTasks(ctx, cp.Inputs, cp.SkipPreHandler, cp.ToolsNodeExecutedTools, cp.RerunNodes, isStream, optMap)
 			if err != nil {
 				return nil, newGraphRunError(fmt.Errorf("restore tasks fail: %w", err))
 			}
@@ -260,7 +262,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 				cm.channels,
 				isStream,
 				isSubGraph,
-				checkPointID,
+				writeToCheckPointID,
 			)
 		}
 	}
@@ -311,7 +313,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 				ctx,
 				tempInfo,
 				append(completedTasks, cpt...),
-				checkPointID,
+				writeToCheckPointID,
 				isSubGraph,
 				cm,
 				isStream,
@@ -347,7 +349,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 					ctx,
 					tempInfo,
 					append(completedTasks, newCompletedTasks...),
-					checkPointID,
+					writeToCheckPointID,
 					isSubGraph,
 					cm,
 					isStream,
@@ -366,7 +368,7 @@ func (r *runner) run(ctx context.Context, isStream bool, input any, opts ...Opti
 			tempInfo.interruptBeforeNodes = append(tempInfo.interruptBeforeNodes, getHitKey(newNextTasks, r.interruptBeforeNodes)...)
 
 			// simple interrupt
-			return nil, r.handleInterrupt(ctx, tempInfo, append(nextTasks, newNextTasks...), cm.channels, isStream, isSubGraph, checkPointID)
+			return nil, r.handleInterrupt(ctx, tempInfo, append(nextTasks, newNextTasks...), cm.channels, isStream, isSubGraph, writeToCheckPointID)
 		}
 	}
 }
@@ -547,20 +549,12 @@ func (r *runner) handleInterruptWithSubGraphAndRerunNodes(
 		SubGraphs:       make(map[string]*InterruptInfo),
 	}
 	for _, t := range subgraphTasks {
-		if isStream {
-			cp.Inputs[t.nodeKey] = t.call.action.inputEmptyStream()
-		} else {
-			cp.Inputs[t.nodeKey] = t.call.action.inputZeroValue()
-		}
+		cp.RerunNodes = append(cp.RerunNodes, t.nodeKey)
 		cp.SubGraphs[t.nodeKey] = tempInfo.subGraphInterrupts[t.nodeKey].CheckPoint
 		intInfo.SubGraphs[t.nodeKey] = tempInfo.subGraphInterrupts[t.nodeKey].Info
 	}
 	for _, t := range rerunTasks {
-		if isStream {
-			cp.Inputs[t.nodeKey] = t.call.action.inputEmptyStream()
-		} else {
-			cp.Inputs[t.nodeKey] = t.call.action.inputZeroValue()
-		}
+		cp.RerunNodes = append(cp.RerunNodes, t.nodeKey)
 	}
 	err = r.checkPointer.convertCheckPoint(cp, isStream)
 	if err != nil {
@@ -628,20 +622,45 @@ func (r *runner) createTasks(ctx context.Context, nodeMap map[string]any, optMap
 	return nextTasks, nil
 }
 
-func getCheckPointInfo(opts ...Option) (checkPointID *string, stateModifier StateModifier) {
+func getCheckPointInfo(opts ...Option) (checkPointID *string, writeToCheckPointID *string, stateModifier StateModifier, forceNewRun bool) {
 	for _, opt := range opts {
 		if opt.checkPointID != nil {
 			checkPointID = opt.checkPointID
 		}
+		if opt.writeToCheckPointID != nil {
+			writeToCheckPointID = opt.writeToCheckPointID
+		}
 		if opt.stateModifier != nil {
 			stateModifier = opt.stateModifier
 		}
+		forceNewRun = opt.forceNewRun
 	}
-	return checkPointID, stateModifier
+	if writeToCheckPointID == nil {
+		writeToCheckPointID = checkPointID
+	}
+	return
 }
 
-func (r *runner) restoreTasks(ctx context.Context, inputs map[string]any, skipPreHandler map[string]bool, toolNodeExecutedTools map[string]map[string]string, optMap map[string][]any) ([]*task, error) {
+func (r *runner) restoreTasks(
+	ctx context.Context,
+	inputs map[string]any,
+	skipPreHandler map[string]bool,
+	toolNodeExecutedTools map[string]map[string]string,
+	rerunNodes []string,
+	isStream bool,
+	optMap map[string][]any) ([]*task, error) {
 	ret := make([]*task, 0, len(inputs))
+	for _, key := range rerunNodes {
+		call, ok := r.chanSubscribeTo[key]
+		if !ok {
+			return nil, fmt.Errorf("channel[%s] from checkpoint is not registered", key)
+		}
+		if isStream {
+			inputs[key] = call.action.inputEmptyStream()
+		} else {
+			inputs[key] = call.action.inputZeroValue()
+		}
+	}
 	for key, input := range inputs {
 		call, ok := r.chanSubscribeTo[key]
 		if !ok {
@@ -649,6 +668,7 @@ func (r *runner) restoreTasks(ctx context.Context, inputs map[string]any, skipPr
 		}
 
 		if call.action.nodeInfo != nil && call.action.nodeInfo.compileOption != nil {
+			// sub graph
 			ctx = forwardCheckPoint(ctx, key)
 		}
 
@@ -811,6 +831,12 @@ func (r *runner) initChannelManager(isStream bool) *channelManager {
 		controlPredecessors[k] = make(map[string]struct{})
 		for _, v := range vs {
 			controlPredecessors[k][v] = struct{}{}
+		}
+	}
+
+	for k, v := range chs {
+		if cfg, ok := r.mergeConfigs[k]; ok {
+			v.setMergeConfig(cfg)
 		}
 	}
 

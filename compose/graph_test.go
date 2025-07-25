@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -1724,4 +1725,243 @@ func TestHandlerTypeValidate(t *testing.T) {
 		return nil, nil
 	}), WithOutputKey("output"))
 	assert.NoError(t, err)
+}
+
+func TestSetFanInMergeConfig_RealStreamNode(t *testing.T) {
+	for _, triggerMode := range []NodeTriggerMode{AnyPredecessor, AllPredecessor} {
+		t.Run(string(triggerMode), func(t *testing.T) {
+			g := NewGraph[int, map[string]any]()
+
+			// Add two stream nodes that output streams of int slices
+			err := g.AddLambdaNode("s1", StreamableLambda(func(ctx context.Context, input int) (*schema.StreamReader[int], error) {
+				sr, sw := schema.Pipe[int](2)
+				sw.Send(input+1, nil)
+				sw.Send(input+2, nil)
+				sw.Close()
+				return sr, nil
+			}), WithOutputKey("s1"))
+			assert.NoError(t, err)
+			err = g.AddLambdaNode("s2", StreamableLambda(func(ctx context.Context, input int) (*schema.StreamReader[int], error) {
+				sr, sw := schema.Pipe[int](2)
+				sw.Send(input+10, nil)
+				sw.Send(input+20, nil)
+				sw.Close()
+				return sr, nil
+			}), WithOutputKey("s2"))
+			assert.NoError(t, err)
+
+			// Connect edges: START -> s1, START -> s2, s1 -> END, s2 -> END
+			err = g.AddEdge(START, "s1")
+			assert.NoError(t, err)
+			err = g.AddEdge(START, "s2")
+			assert.NoError(t, err)
+			err = g.AddEdge("s1", END)
+			assert.NoError(t, err)
+			err = g.AddEdge("s2", END)
+			assert.NoError(t, err)
+
+			r, err := g.Compile(context.Background(), WithNodeTriggerMode(triggerMode),
+				WithFanInMergeConfig(map[string]FanInMergeConfig{END: {StreamMergeWithSourceEOF: true}}))
+			assert.NoError(t, err)
+
+			// Run the graph in stream mode and check for SourceEOF events
+			sr, err := r.Stream(context.Background(), 1)
+			assert.NoError(t, err)
+
+			merged := make(map[string]map[int]bool)
+			var sourceEOFCount int
+			sourceNames := make(map[string]bool)
+			for {
+				m, e := sr.Recv()
+				if e != nil {
+					if name, ok := schema.GetSourceName(e); ok {
+						sourceEOFCount++
+						sourceNames[name] = true
+						continue
+					}
+					if e == io.EOF {
+						break
+					}
+					assert.NoError(t, e)
+				}
+
+				for k, v := range m {
+					if merged[k] == nil {
+						merged[k] = make(map[int]bool)
+					}
+
+					merged[k][v.(int)] = true
+				}
+			}
+
+			// The merged map should contain both results
+			assert.Equal(t, map[string]map[int]bool{"s1": {2: true, 3: true}, "s2": {11: true, 21: true}}, merged)
+			assert.Equal(t, 2, sourceEOFCount, "should receive SourceEOF for each input stream when StreamMergeWithSourceEOF is true")
+			assert.True(t, sourceNames["s1"], "should receive SourceEOF from s1")
+			assert.True(t, sourceNames["s2"], "should receive SourceEOF from s2")
+		})
+	}
+}
+
+func TestFindLoops(t *testing.T) {
+	tests := []struct {
+		name       string
+		startNodes []string
+		chanCalls  map[string]*chanCall
+		expected   [][]string
+	}{
+		{
+			name:       "Graph without cycles",
+			startNodes: []string{"A"},
+			chanCalls: map[string]*chanCall{
+				"A": {
+					controls: []string{"B", "C"},
+				},
+				"B": {
+					controls: []string{"D"},
+				},
+				"C": {
+					controls: []string{"E"},
+				},
+				"D": {
+					controls: []string{},
+				},
+				"E": {
+					controls: []string{},
+				},
+			},
+			expected: [][]string{},
+		},
+		{
+			name:       "Graph with self-loop",
+			startNodes: []string{"A"},
+			chanCalls: map[string]*chanCall{
+				"A": {
+					controls: []string{"A", "B"},
+				},
+				"B": {
+					controls: []string{},
+				},
+			},
+			expected: [][]string{{"A", "A"}},
+		},
+		{
+			name:       "Graph with simple cycle",
+			startNodes: []string{"A", "B", "C"},
+			chanCalls: map[string]*chanCall{
+				"A": {
+					controls: []string{"B"},
+				},
+				"B": {
+					controls: []string{"C"},
+				},
+				"C": {
+					controls: []string{"A"},
+				},
+			},
+			expected: [][]string{{"A", "B", "C", "A"}},
+		},
+		{
+			name:       "Graph with multiple cycles",
+			startNodes: []string{"A", "B", "C", "D", "E", "F"},
+			chanCalls: map[string]*chanCall{
+				"A": {
+					controls: []string{"B", "D"},
+				},
+				"B": {
+					controls: []string{"C"},
+				},
+				"C": {
+					controls: []string{"B"},
+				},
+				"D": {
+					controls: []string{"E"},
+				},
+				"E": {
+					controls: []string{"F"},
+				},
+				"F": {
+					controls: []string{"D"},
+				},
+			},
+			expected: [][]string{{"B", "C", "B"}, {"D", "E", "F", "D"}},
+		},
+		{
+			name:       "Graph with branch cycle",
+			startNodes: []string{"A", "C"},
+			chanCalls: map[string]*chanCall{
+				"A": {
+					controls: []string{"B"},
+					writeToBranches: []*GraphBranch{
+						{
+							endNodes: map[string]bool{
+								"C": true,
+							},
+						},
+					},
+				},
+				"B": {
+					controls: []string{},
+				},
+				"C": {
+					controls: []string{"A"},
+				},
+			},
+			expected: [][]string{{"A", "C", "A"}},
+		},
+		{
+			name:       "Empty graph",
+			startNodes: []string{},
+			chanCalls:  map[string]*chanCall{},
+			expected:   [][]string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loops := findLoops(tt.startNodes, tt.chanCalls)
+
+			assert.Equal(t, len(tt.expected), len(loops))
+
+			if len(tt.expected) > 0 {
+				normalizedExpected := normalizeLoops(tt.expected)
+				normalizedActual := normalizeLoops(loops)
+				assert.Equal(t, normalizedExpected, normalizedActual)
+			}
+		})
+	}
+}
+func normalizeLoops(loops [][]string) []string {
+	result := make([]string, 0, len(loops))
+
+	for _, loop := range loops {
+		if len(loop) == 0 {
+			continue
+		}
+
+		normalizedLoop := make([]string, len(loop))
+		copy(normalizedLoop, loop)
+		if normalizedLoop[0] != normalizedLoop[len(normalizedLoop)-1] {
+			normalizedLoop = append(normalizedLoop, normalizedLoop[0])
+		}
+
+		minIdx := 0
+		for i := 1; i < len(normalizedLoop)-1; i++ {
+			if normalizedLoop[i] < normalizedLoop[minIdx] {
+				minIdx = i
+			}
+		}
+
+		canonicalLoop := ""
+		for i := 0; i < len(normalizedLoop)-1; i++ {
+			idx := (minIdx + i) % (len(normalizedLoop) - 1)
+			canonicalLoop += normalizedLoop[idx] + ","
+		}
+		canonicalLoop += normalizedLoop[minIdx]
+
+		result = append(result, canonicalLoop)
+	}
+
+	sort.Strings(result)
+	return result
 }

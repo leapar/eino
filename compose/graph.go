@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/cloudwego/eino/components/document"
 	"github.com/cloudwego/eino/components/embedding"
@@ -497,6 +498,14 @@ func (g *graph) addBranch(startNode string, branch *GraphBranch, skipData bool) 
 			}
 		}
 	} else {
+		for endNode := range branch.endNodes {
+			if startNode == START {
+				g.startNodes = append(g.startNodes, endNode)
+			}
+			if endNode == END {
+				g.endNodes = append(g.endNodes, startNode)
+			}
+		}
 		branch.noDataFlow = true
 	}
 
@@ -637,7 +646,7 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 	cb := pregelChannelBuilder
 	if isChain(g.cmp) || isWorkflow(g.cmp) {
 		if opt != nil && opt.nodeTriggerMode != "" {
-			return nil, errors.New("chain doesn't support node trigger mode option")
+			return nil, errors.New(fmt.Sprintf("%s doesn't support node trigger mode option", g.cmp))
 		}
 	}
 	if (opt != nil && opt.nodeTriggerMode == AllPredecessor) || isWorkflow(g.cmp) {
@@ -762,6 +771,14 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 	}
 	copy(inputChannels.writeToBranches, g.branches[START])
 
+	var mergeConfigs map[string]FanInMergeConfig
+	if opt != nil {
+		mergeConfigs = opt.mergeConfigs
+	}
+	if mergeConfigs == nil {
+		mergeConfigs = make(map[string]FanInMergeConfig)
+	}
+
 	r := &runner{
 		chanSubscribeTo:     chanSubscribeTo,
 		controlPredecessors: controlPredecessors,
@@ -780,6 +797,8 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 		preBranchHandlerManager: &preBranchHandlerManager{h: g.handlerPreBranch},
 		preNodeHandlerManager:   &preNodeHandlerManager{h: g.handlerPreNode},
 		edgeHandlerManager:      &edgeHandlerManager{h: g.handlerOnEdges},
+
+		mergeConfigs: mergeConfigs,
 	}
 
 	successors := make(map[string][]string)
@@ -813,7 +832,7 @@ func (g *graph) compile(ctx context.Context, opt *graphCompileOptions) (*composa
 		}
 		inputPairs[END] = r.outputConvertStreamPair
 		outputPairs[START] = r.inputConvertStreamPair
-		r.checkPointer = newCheckPointer(inputPairs, outputPairs, opt.checkPointStore)
+		r.checkPointer = newCheckPointer(inputPairs, outputPairs, opt.checkPointStore, opt.serializer)
 
 		r.interruptBeforeNodes = opt.interruptBeforeNodes
 		r.interruptAfterNodes = opt.interruptAfterNodes
@@ -1043,12 +1062,88 @@ func validateDAG(chanSubscribeTo map[string]*chanCall, controlPredecessors map[s
 		}
 	}
 
+	var loopStarts []string
 	for k, v := range m {
 		if v > 0 {
-			return fmt.Errorf("DAG invalid, node[%s] has loop", k)
+			loopStarts = append(loopStarts, k)
 		}
 	}
+	if len(loopStarts) > 0 {
+		return fmt.Errorf("%w: %s", DAGInvalidLoopErr, formatLoops(findLoops(loopStarts, chanSubscribeTo)))
+	}
 	return nil
+}
+
+var DAGInvalidLoopErr = errors.New("DAG is invalid, has loop")
+
+func findLoops(startNodes []string, chanCalls map[string]*chanCall) [][]string {
+	controlSuccessors := map[string][]string{}
+	for node, ch := range chanCalls {
+		controlSuccessors[node] = append(controlSuccessors[node], ch.controls...)
+		for _, b := range ch.writeToBranches {
+			for end := range b.endNodes {
+				controlSuccessors[node] = append(controlSuccessors[node], end)
+			}
+		}
+	}
+
+	visited := map[string]bool{}
+	var dfs func(path []string) [][]string
+	dfs = func(path []string) [][]string {
+		var ret [][]string
+		pathEnd := path[len(path)-1]
+		successors, ok := controlSuccessors[pathEnd]
+		if !ok {
+			return nil
+		}
+		for _, successor := range successors {
+			visited[successor] = true
+
+			if successor == END {
+				continue
+			}
+
+			var looped bool
+			for i, node := range path {
+				if node == successor {
+					ret = append(ret, append(path[i:], successor))
+					looped = true
+					break
+				}
+			}
+			if looped {
+				continue
+			}
+
+			ret = append(ret, dfs(append(path, successor))...)
+		}
+		return ret
+	}
+
+	var ret [][]string
+	for _, node := range startNodes {
+		if !visited[node] {
+			ret = append(ret, dfs([]string{node})...)
+		}
+	}
+	return ret
+}
+
+func formatLoops(loops [][]string) string {
+	sb := strings.Builder{}
+	for _, loop := range loops {
+		if len(loop) == 0 {
+			continue
+		}
+		sb.WriteString("[")
+		sb.WriteString(loop[0])
+		for i := 1; i < len(loop); i++ {
+			sb.WriteString("->")
+			sb.WriteString(loop[i])
+		}
+		sb.WriteString("]")
+	}
+	return sb.String()
 }
 
 func NewNodePath(path ...string) *NodePath {

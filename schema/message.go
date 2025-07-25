@@ -308,6 +308,9 @@ type Message struct {
 
 	ResponseMeta *ResponseMeta `json:"response_meta,omitempty"`
 
+	// ReasoningContent is the thinking process of the model, which will be included when the model returns reasoning content.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+
 	// customized information for model implementation
 	Extra map[string]any `json:"extra,omitempty"`
 }
@@ -474,24 +477,31 @@ func (m *Message) Format(_ context.Context, vs map[string]any, formatType Format
 //		tool: {...}
 //		call_id: callxxxx
 func (m *Message) String() string {
-	s := fmt.Sprintf("%s: %s", m.Role, m.Content)
+	sb := &strings.Builder{}
+	sb.WriteString(fmt.Sprintf("%s: %s", m.Role, m.Content))
 	if len(m.ToolCalls) > 0 {
-		s += fmt.Sprintf("\ntool_calls: %v", m.ToolCalls)
+		sb.WriteString(fmt.Sprintf("\ntool_calls:\n"))
+		for _, tc := range m.ToolCalls {
+			if tc.Index != nil {
+				sb.WriteString(fmt.Sprintf("index[%d]:", *tc.Index))
+			}
+			sb.WriteString(fmt.Sprintf("%+v\n", tc))
+		}
 	}
 	if m.ToolCallID != "" {
-		s += fmt.Sprintf("\ntool_call_id: %s", m.ToolCallID)
+		sb.WriteString(fmt.Sprintf("\ntool_call_id: %s", m.ToolCallID))
 	}
 	if m.ToolName != "" {
-		s += fmt.Sprintf("\ntool_call_name: %s", m.ToolName)
+		sb.WriteString(fmt.Sprintf("\ntool_call_name: %s", m.ToolName))
 	}
 	if m.ResponseMeta != nil {
-		s += fmt.Sprintf("\nfinish_reason: %s", m.ResponseMeta.FinishReason)
+		sb.WriteString(fmt.Sprintf("\nfinish_reason: %s", m.ResponseMeta.FinishReason))
 		if m.ResponseMeta.Usage != nil {
-			s += fmt.Sprintf("\nusage: %v", m.ResponseMeta.Usage)
+			sb.WriteString(fmt.Sprintf("\nusage: %v", m.ResponseMeta.Usage))
 		}
 	}
 
-	return s
+	return sb.String()
 }
 
 // SystemMessage represents a message with Role "system".
@@ -650,11 +660,13 @@ func concatToolCalls(chunks []ToolCall) ([]ToolCall, error) {
 // concatedMsg, err := ConcatMessages(msgs) // concatedMsg.Content will be full content of all messages
 func ConcatMessages(msgs []*Message) (*Message, error) {
 	var (
-		contents   []string
-		contentLen int
-		toolCalls  []ToolCall
-		ret        = Message{}
-		extraList  = make([]map[string]any, 0, len(msgs))
+		contents            []string
+		contentLen          int
+		reasoningContents   []string
+		reasoningContentLen int
+		toolCalls           []ToolCall
+		ret                 = Message{}
+		extraList           = make([]map[string]any, 0, len(msgs))
 	)
 
 	for idx, msg := range msgs {
@@ -700,6 +712,10 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 		if msg.Content != "" {
 			contents = append(contents, msg.Content)
 			contentLen += len(msg.Content)
+		}
+		if msg.ReasoningContent != "" {
+			reasoningContents = append(reasoningContents, msg.ReasoningContent)
+			reasoningContentLen += len(msg.ReasoningContent)
 		}
 
 		if len(msg.ToolCalls) > 0 {
@@ -756,7 +772,6 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 	if len(contents) > 0 {
 		var sb strings.Builder
 		sb.Grow(contentLen)
-		sb.WriteString(ret.Content)
 		for _, content := range contents {
 			_, err := sb.WriteString(content)
 			if err != nil {
@@ -765,6 +780,18 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 		}
 
 		ret.Content = sb.String()
+	}
+	if len(reasoningContents) > 0 {
+		var sb strings.Builder
+		sb.Grow(reasoningContentLen)
+		for _, rc := range reasoningContents {
+			_, err := sb.WriteString(rc)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		ret.ReasoningContent = sb.String()
 	}
 
 	if len(toolCalls) > 0 {
@@ -788,6 +815,8 @@ func ConcatMessages(msgs []*Message) (*Message, error) {
 }
 
 func ConcatMessageStream(s *StreamReader[*Message]) (*Message, error) {
+	defer s.Close()
+
 	var msgs []*Message
 	for {
 		msg, err := s.Recv()

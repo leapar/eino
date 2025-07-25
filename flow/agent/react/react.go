@@ -78,6 +78,13 @@ type AgentConfig struct {
 	// Note: The default implementation does not work well with Claude, which typically outputs tool calls after text content.
 	// Note: If your ChatModel doesn't output tool calls first, you can try adding prompts to constrain the model from generating extra text during the tool call.
 	StreamToolCallChecker func(ctx context.Context, modelOutput *schema.StreamReader[*schema.Message]) (bool, error)
+
+	//the node name of the graph. If empty, will be filled with default value "ReActAgent".
+	GraphName string
+	// the node name of the model node in the graph. If empty, will be filled with default value "ChatModel".
+	ModelNodeName string
+	// the node name of the tools node in the graph. If empty, will be filled with default value "Tools".
+	ToolsNodeName string
 }
 
 // Deprecated: This approach of adding persona involves unnecessary slice copying overhead.
@@ -136,6 +143,18 @@ const (
 	ToolsNodeName = "Tools"
 )
 
+// SetReturnDirectly is a helper function that can be called within a tool's execution.
+// It signals the ReAct agent to stop further processing and return the result of the current tool call directly.
+// This is useful when the tool's output is the final answer and no more steps are needed.
+// Note: If multiple tools call this function in the same step, only the last call will take effect.
+// This setting has a higher priority than the AgentConfig.ToolReturnDirectly.
+func SetReturnDirectly(ctx context.Context) error {
+	return compose.ProcessState(ctx, func(ctx context.Context, s *state) error {
+		s.ReturnDirectlyToolCallID = compose.GetToolCallID(ctx)
+		return nil
+	})
+}
+
 // Agent is the ReAct agent.
 // ReAct agent is a simple agent that handles user messages with a chat model and tools.
 // ReAct will call the chat model, if the message contains tool calls, it will call the tools.
@@ -177,6 +196,21 @@ func NewAgent(ctx context.Context, config *AgentConfig) (_ *Agent, err error) {
 		return
 	}
 
+	graphName := GraphName
+	if config.GraphName != "" {
+		graphName = config.GraphName
+	}
+
+	modelNodeName := ModelNodeName
+	if config.ModelNodeName != "" {
+		modelNodeName = config.ModelNodeName
+	}
+
+	toolsNodeName := ToolsNodeName
+	if config.ToolsNodeName != "" {
+		toolsNodeName = config.ToolsNodeName
+	}
+
 	if toolCallChecker == nil {
 		toolCallChecker = firstChunkStreamToolCallChecker
 	}
@@ -209,7 +243,7 @@ func NewAgent(ctx context.Context, config *AgentConfig) (_ *Agent, err error) {
 		return messageModifier(ctx, modifiedInput), nil
 	}
 
-	if err = graph.AddChatModelNode(nodeKeyModel, chatModel, compose.WithStatePreHandler(modelPreHandle), compose.WithNodeName(ModelNodeName)); err != nil {
+	if err = graph.AddChatModelNode(nodeKeyModel, chatModel, compose.WithStatePreHandler(modelPreHandle), compose.WithNodeName(modelNodeName)); err != nil {
 		return nil, err
 	}
 
@@ -225,7 +259,7 @@ func NewAgent(ctx context.Context, config *AgentConfig) (_ *Agent, err error) {
 		state.ReturnDirectlyToolCallID = getReturnDirectlyToolCallID(input, config.ToolReturnDirectly)
 		return input, nil
 	}
-	if err = graph.AddToolsNode(nodeKeyTools, toolsNode, compose.WithStatePreHandler(toolsNodePreHandle), compose.WithNodeName(ToolsNodeName)); err != nil {
+	if err = graph.AddToolsNode(nodeKeyTools, toolsNode, compose.WithStatePreHandler(toolsNodePreHandle), compose.WithNodeName(toolsNodeName)); err != nil {
 		return nil, err
 	}
 
@@ -242,15 +276,11 @@ func NewAgent(ctx context.Context, config *AgentConfig) (_ *Agent, err error) {
 		return nil, err
 	}
 
-	if len(config.ToolReturnDirectly) > 0 {
-		if err = buildReturnDirectly(graph); err != nil {
-			return nil, err
-		}
-	} else if err = graph.AddEdge(nodeKeyTools, nodeKeyModel); err != nil {
+	if err = buildReturnDirectly(graph); err != nil {
 		return nil, err
 	}
 
-	compileOpts := []compose.GraphCompileOption{compose.WithMaxRunSteps(config.MaxStep), compose.WithNodeTriggerMode(compose.AnyPredecessor), compose.WithGraphName(GraphName)}
+	compileOpts := []compose.GraphCompileOption{compose.WithMaxRunSteps(config.MaxStep), compose.WithNodeTriggerMode(compose.AnyPredecessor), compose.WithGraphName(graphName)}
 	runnable, err := graph.Compile(ctx, compileOpts...)
 	if err != nil {
 		return nil, err

@@ -74,8 +74,8 @@ type MultiAgentConfig struct {
 	Host        Host
 	Specialists []*Specialist
 
-	Name string // the name of the host multi-agent
-
+	Name         string // the name of the host multi-agent
+	HostNodeName string // the name of the host node in the graph, default is "host"
 	// StreamOutputHandler is a function to determine whether the model's streaming output contains tool calls.
 	// Different models have different ways of outputting tool calls in streaming mode:
 	// - Some models (like OpenAI) output tool calls directly
@@ -155,6 +155,7 @@ type Host struct {
 // Specialist is a specialist agent within a host multi-agent system.
 // It can be a model.ChatModel or any Invokable and/or Streamable, such as react.Agent.
 // ChatModel and (Invokable / Streamable) are mutually exclusive, only one should be provided.
+// notice: SystemPrompt only effects when ChatModel has been set.
 // If Invokable is provided but not Streamable, then the Specialist will be 'compose.InvokableLambda'.
 // If Streamable is provided but not Invokable, then the Specialist will be 'compose.StreamableLambda'.
 // if Both Invokable and Streamable is provided, then the Specialist will be 'compose.AnyLambda'.
